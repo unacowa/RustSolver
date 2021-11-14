@@ -16,7 +16,8 @@ name = "gen_abstraction"
 path = "src/gen_abstraction/main.rs"
 
 [dependencies]
-rust_poker = "0.1.5"
+hand_indexer = "0.1.2"
+rust_poker = "0.1.14"
 crossbeam = "0.7.3"
 rayon = "1.0.1"
 bytepack = "0.4.1"

@@ -1,24 +1,23 @@
 // use bytepack::{ LEUnpacker };
-use std::io::prelude::*;
-use std::fs::File;
-use std::io::SeekFrom;
-use std::io::BufReader;
-use combine::Parser;
 use combine::parser::byte::num::le_f32;
+use combine::Parser;
+use std::fs::File;
+use std::io::prelude::*;
+use std::io::BufReader;
+use std::io::SeekFrom;
 use std::io::{Error, ErrorKind};
 
-use rust_poker::hand_indexer_s;
+use hand_indexer::HandIndexer;
 
 /**
  * structur to interface with EHS.dat table
  */
 pub struct EHS {
-    pub indexers: [hand_indexer_s; 4],
+    pub indexers: [HandIndexer; 4],
     // offsets for lookup table
     offsets: [u64; 4],
-    file: File
-    // file pointer to lookup table
-    // file_location: str
+    file: File, // file pointer to lookup table
+                // file_location: str
 }
 
 impl EHS {
@@ -27,20 +26,19 @@ impl EHS {
      */
     pub fn new() -> EHS {
         let indexers = [
-            hand_indexer_s::init(1, [ 2 ].to_vec()),
-            hand_indexer_s::init(2, [ 2, 3 ].to_vec()),
-            hand_indexer_s::init(2, [ 2, 4 ].to_vec()),
-            hand_indexer_s::init(2, [ 2, 5 ].to_vec()),
+            HandIndexer::init(1, [2].to_vec()),
+            HandIndexer::init(2, [2, 3].to_vec()),
+            HandIndexer::init(2, [2, 4].to_vec()),
+            HandIndexer::init(2, [2, 5].to_vec()),
         ];
         let mut offsets: [u64; 4] = [0; 4];
         for i in 1..4 {
-            offsets[i] = offsets[i-1]
-                    + indexers[i-1].size(if i == 1 { 0 } else { 1 });
+            offsets[i] = offsets[i - 1] + indexers[i - 1].size(if i == 1 { 0 } else { 1 });
         }
         EHS {
             indexers: indexers,
             offsets: offsets,
-            file: File::open("ehs.dat").unwrap()
+            file: File::open("ehs.dat").unwrap(),
         }
     }
 
@@ -56,7 +54,7 @@ impl EHS {
             5 => 1,
             6 => 2,
             7 => 3,
-            _ => panic!("ERRROR")
+            _ => panic!("ERRROR"),
         };
 
         let index = self.indexers[i].get_index(cards);
@@ -66,7 +64,7 @@ impl EHS {
         match result {
             Ok((val, _)) => {
                 return Ok(val);
-            },
+            }
             Err(_) => {
                 return Err(Error::new(ErrorKind::Other, "Unexpected Parse"));
             }
@@ -77,9 +75,9 @@ impl EHS {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use test::Bencher;
-    use rand::distributions::{Uniform};
+    use rand::distributions::Uniform;
     use rand::{thread_rng, Rng};
+    use test::Bencher;
 
     /**
      * return a vector of n random cards
@@ -140,5 +138,4 @@ mod tests {
         let cards = random_cards(7);
         b.iter(|| ehs_table.get_ehs(cards.as_slice()).unwrap())
     }
-
 }

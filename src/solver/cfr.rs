@@ -1,42 +1,42 @@
-use std::iter::FromIterator;
-use std::{thread, time};
 use crossbeam::atomic::AtomicCell;
+use std::iter::FromIterator;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::{thread, time};
 
-use rand::{SeedableRng, thread_rng};
-use rand::Rng;
-use rand::rngs::SmallRng;
-use rand::seq::SliceRandom;
 use rand::distributions::WeightedIndex;
 use rand::distributions::{Distribution, Uniform};
+use rand::rngs::SmallRng;
+use rand::seq::SliceRandom;
+use rand::Rng;
+use rand::{thread_rng, SeedableRng};
 
-use rust_poker::hand_range::{HandRange, HoleCards};
-use rust_poker::equity_calculator::{get_board_from_bit_mask, calc_equity, remove_invalid_combos};
 use rust_poker::constants::{CARD_COUNT, RANK_TO_CHAR, SUIT_TO_CHAR};
-use rust_poker::hand_evaluator::{Hand, CARDS, evaluate};
+use rust_poker::equity_calculator::approx_equity;
+use rust_poker::hand_evaluator::{evaluate, Hand, CARDS};
+use rust_poker::hand_range::{Combo, HandRange};
 
 use rayon::prelude::*;
 
-use crate::tree::{Tree, NodeId};
-use crate::nodes::{TerminalType};
-use crate::tree_builder::build_game_tree;
-use crate::infoset::{Infoset, InfosetTable, create_infosets};
+use crate::card_abstraction::{CardAbstraction, ICardAbstraction, EMD, ISOMORPHIC};
+use crate::infoset::{create_infosets, Infoset, InfosetTable};
 use crate::nodes::GameTreeNode;
+use crate::nodes::TerminalType;
 use crate::options::Options;
-use crate::card_abstraction::{CardAbstraction, ISOMORPHIC, EMD, ICardAbstraction};
 use crate::state::BettingRound;
+use crate::tree::{NodeId, Tree};
+use crate::tree_builder::build_game_tree;
 
 #[derive(Debug, Copy, Clone)]
 struct TrainHand {
-    pub hands: [HoleCards; 2],
-    pub board: [u8; 7]
+    pub hands: [Combo; 2],
+    pub board: [u8; 7],
 }
 
 impl TrainHand {
     /// Returns eval repr of board
     fn get_hand(&self, player: u8) -> Hand {
-        let mut hand = Hand::empty();
+        let mut hand = Hand::default();
         hand += CARDS[usize::from(self.hands[usize::from(player)].0)];
         hand += CARDS[usize::from(self.hands[usize::from(player)].1)];
         for i in 2..7 {
@@ -52,13 +52,13 @@ fn generate_possible_next_deals(round: BettingRound, hand: &TrainHand) -> Vec<u8
     let n_board_cards = match round {
         BettingRound::Flop => panic!("invalid number of board cards"),
         BettingRound::Turn => 3,
-        BettingRound::River => 4
+        BettingRound::River => 4,
     };
     for i in 0..2 {
         used_cards_mask |= (1u64 << hand.hands[i].0) | (1u64 << hand.hands[i].1);
     }
     for i in 0..n_board_cards {
-        used_cards_mask |= 1u64 << hand.board[i+2];
+        used_cards_mask |= 1u64 << hand.board[i + 2];
     }
     let mut possible_cards: Vec<u8> = Vec::new();
     for i in 0..CARD_COUNT {
@@ -71,7 +71,6 @@ fn generate_possible_next_deals(round: BettingRound, hand: &TrainHand) -> Vec<u8
 
 /// get all possible hole card combos
 fn generate_all_hole_card_combos(mut board_mask: u64, hand_ranges: &[HandRange]) -> Vec<TrainHand> {
-
     // copy board
     let mut board = [0u8; 7];
     let mut i = 2;
@@ -89,7 +88,7 @@ fn generate_all_hole_card_combos(mut board_mask: u64, hand_ranges: &[HandRange])
             if ci_mask & cj_mask == 0 {
                 combos.push(TrainHand {
                     board: board.clone(),
-                    hands: [*ci, *cj]
+                    hands: [*ci, *cj],
                 });
             }
         }
@@ -98,7 +97,6 @@ fn generate_all_hole_card_combos(mut board_mask: u64, hand_ranges: &[HandRange])
 }
 
 fn generate_hand<R: Rng>(rng: &mut R, mut board_mask: u64, hand_ranges: &[HandRange]) -> TrainHand {
-
     let mut used_cards_mask = board_mask;
     let mut board = [0u8; 7];
     let mut i = 2;
@@ -121,7 +119,7 @@ fn generate_hand<R: Rng>(rng: &mut R, mut board_mask: u64, hand_ranges: &[HandRa
         }
     }
 
-    let mut hands = [HoleCards(0, 0); 2];
+    let mut hands = [Combo(0, 0, 100); 2];
 
     for i in 0..2 {
         loop {
@@ -136,12 +134,8 @@ fn generate_hand<R: Rng>(rng: &mut R, mut board_mask: u64, hand_ranges: &[HandRa
         }
     }
 
-    TrainHand {
-        board,
-        hands
-    }
+    TrainHand { board, hands }
 }
-
 
 /**
  * A structure to implement monte carlo cfr
@@ -157,10 +151,11 @@ pub struct MCCFRTrainer {
 
 impl MCCFRTrainer {
     pub fn init(options: Options) -> Self {
-
         let mut hand_ranges = options.hand_ranges.to_owned();
-
-        remove_invalid_combos(&mut hand_ranges, options.board_mask);
+        // remove_invalid_combos(&mut hand_ranges, options.board_mask);
+        hand_ranges
+            .iter_mut()
+            .for_each(|h| h.remove_conflicting_combos(options.board_mask));
 
         let (n_actions, game_tree) = build_game_tree(&options);
 
@@ -168,7 +163,11 @@ impl MCCFRTrainer {
             // CardAbstraction::EMD(EMD::init(&hand_ranges, options.board_mask, BettingRound::Flop)),
             // CardAbstraction::ISOMORPHIC(ISOMORPHIC::init(&hand_ranges, options.board_mask, BettingRound::Flop)),
             // CardAbstraction::ISOMORPHIC(ISOMORPHIC::init(&hand_ranges, options.board_mask, BettingRound::Turn)),
-            CardAbstraction::ISOMORPHIC(ISOMORPHIC::init(&hand_ranges, options.board_mask, BettingRound::River)),
+            CardAbstraction::ISOMORPHIC(ISOMORPHIC::init(
+                &hand_ranges,
+                options.board_mask,
+                BettingRound::River,
+            )),
         ];
 
         // intialize infosets
@@ -179,7 +178,7 @@ impl MCCFRTrainer {
             game_tree,
             hand_ranges,
             initial_board_mask: options.board_mask,
-            card_abs
+            card_abs,
         }
     }
     /**
@@ -205,11 +204,11 @@ impl MCCFRTrainer {
                 let t = t.clone();
                 scope.spawn(move |_| {
                     while t.load() < iterations {
-
                         let hand = generate_hand(
-                                &mut rng,
-                                a_self.initial_board_mask,
-                                a_self.hand_ranges.as_slice());
+                            &mut rng,
+                            a_self.initial_board_mask,
+                            a_self.hand_ranges.as_slice(),
+                        );
 
                         let q: f32 = rng.gen();
 
@@ -232,7 +231,6 @@ impl MCCFRTrainer {
             scope.spawn(move |_| {
                 let mut threshold = DISCOUNT_INTERVAL;
                 while t.load() < iterations {
-
                     let onems = time::Duration::from_millis(1);
                     thread::sleep(onems);
 
@@ -249,12 +247,15 @@ impl MCCFRTrainer {
                         let d = p / (p + 1.0);
                         for i in 0..a_self.infosets.len() {
                             for j in 0..a_self.infosets[i].len() {
-                                let infoset_mut = (&a_self.infosets[i][j] as *const Infoset) as *mut Infoset;
+                                let infoset_mut =
+                                    (&a_self.infosets[i][j] as *const Infoset) as *mut Infoset;
                                 let n_actions = unsafe { (*infoset_mut).regrets.len() };
                                 for k in 0..n_actions {
                                     unsafe {
-                                        (*infoset_mut).regrets[k] = ((*infoset_mut).regrets[k] as f32 * d) as i32;
-                                        (*infoset_mut).strategy_sum[k] = ((*infoset_mut).strategy_sum[k] as f32 * d) as i32;
+                                        (*infoset_mut).regrets[k] =
+                                            ((*infoset_mut).regrets[k] as f32 * d) as i32;
+                                        (*infoset_mut).strategy_sum[k] =
+                                            ((*infoset_mut).strategy_sum[k] as f32 * d) as i32;
                                     }
                                 }
                             }
@@ -263,8 +264,8 @@ impl MCCFRTrainer {
                     }
                 }
             });
-
-        }).unwrap();
+        })
+        .unwrap();
 
         // let mut rng = SmallRng::from_rng(thread_rng).unwrap();
         // let mut cards = generate_hand(
@@ -293,24 +294,27 @@ impl MCCFRTrainer {
         //     },
         //     _ => {}
         // }
-
     }
 
-    fn mccfr<R: Rng>(&self,
-            rng: &mut R, node_id: NodeId,
-            player: u8, mut hand: TrainHand,
-            cfr_reach: f32, prune: bool) -> f32 {
-
+    fn mccfr<R: Rng>(
+        &self,
+        rng: &mut R,
+        node_id: NodeId,
+        player: u8,
+        mut hand: TrainHand,
+        cfr_reach: f32,
+        prune: bool,
+    ) -> f32 {
         let node = self.game_tree.get_node(node_id);
         match &node.data {
             GameTreeNode::PublicChance(_) => {
                 // progress to next node
                 return self.mccfr(rng, node.children[0], player, hand, cfr_reach, prune);
-            },
+            }
             GameTreeNode::PrivateChance => {
                 // progress to next node
                 return self.mccfr(rng, node.children[0], player, hand, cfr_reach, prune);
-            },
+            }
             GameTreeNode::Terminal(tn) => {
                 match tn.ttype {
                     TerminalType::UNCONTESTED => {
@@ -319,19 +323,19 @@ impl MCCFRTrainer {
                         } else {
                             return 1.0 * (tn.value as f32);
                         }
-                    },
+                    }
                     TerminalType::SHOWDOWN => {
                         let hands = [hand.get_hand(0), hand.get_hand(1)];
                         let scores = [evaluate(&hands[0]), evaluate(&hands[1])];
                         if scores[0] == scores[1] {
                             return 0.0;
                         }
-                        if scores[usize::from(player)] > scores[usize::from(1-player)] {
+                        if scores[usize::from(player)] > scores[usize::from(1 - player)] {
                             return 1.0 * (tn.value as f32);
                         } else {
                             return -1.0 * (tn.value as f32);
                         }
-                    },
+                    }
                     TerminalType::ALLIN => {
                         // evaluate as showdown
                         let hands = [hand.get_hand(0), hand.get_hand(1)];
@@ -339,16 +343,15 @@ impl MCCFRTrainer {
                         if scores[0] == scores[1] {
                             return 0.0;
                         }
-                        if scores[usize::from(player)] > scores[usize::from(1-player)] {
+                        if scores[usize::from(player)] > scores[usize::from(1 - player)] {
                             return 1.0 * (tn.value as f32);
                         } else {
                             return -1.0 * (tn.value as f32);
                         }
                     }
                 }
-            },
+            }
             GameTreeNode::Action(an) => {
-
                 const PRUNE_THRESHOLD: i32 = -10000000;
 
                 // get number of actions
@@ -360,13 +363,13 @@ impl MCCFRTrainer {
 
                 let cluster_idx = match &self.card_abs[usize::from(an.round_idx)] {
                     CardAbstraction::EMD(card_abs) => card_abs.get_cluster(&hand.board, an.player),
-                    CardAbstraction::ISOMORPHIC(card_abs) => card_abs.get_cluster(&hand.board, an.player),
-                    CardAbstraction::OCHS(card_abs) => card_abs.get_cluster(&hand.board, an.player)
+                    CardAbstraction::ISOMORPHIC(card_abs) => {
+                        card_abs.get_cluster(&hand.board, an.player)
+                    }
+                    CardAbstraction::OCHS(card_abs) => card_abs.get_cluster(&hand.board, an.player),
                 };
 
-                {
-
-                }
+                {}
                 if an.player == player {
                     let mut util = 0f32;
                     let mut utils = vec![0f32; n_actions];
@@ -378,17 +381,21 @@ impl MCCFRTrainer {
                     for i in 0..n_actions {
                         if prune {
                             if infoset.regrets[i] > PRUNE_THRESHOLD {
-                            utils[i] = self.mccfr(
-                                rng, node.children[i],
-                                player, hand, cfr_reach, prune);
-                            util += utils[i] * strategy[i];
-                            explored[i] = true;
+                                utils[i] = self.mccfr(
+                                    rng,
+                                    node.children[i],
+                                    player,
+                                    hand,
+                                    cfr_reach,
+                                    prune,
+                                );
+                                util += utils[i] * strategy[i];
+                                explored[i] = true;
                             }
                         } else {
-                        utils[i] = self.mccfr(
-                            rng, node.children[i],
-                            player, hand, cfr_reach, prune);
-                        util += utils[i] * strategy[i];
+                            utils[i] =
+                                self.mccfr(rng, node.children[i], player, hand, cfr_reach, prune);
+                            util += utils[i] * strategy[i];
                         }
                     }
 
@@ -408,8 +415,6 @@ impl MCCFRTrainer {
                     //     println!("");
                     // }
 
-                    
-
                     // update regrets
                     let infoset_mut = (infoset as *const Infoset) as *mut Infoset;
                     // let mut infoset_wlock = self.infosets[an.index][cluster_idx].write().unwrap();
@@ -418,10 +423,9 @@ impl MCCFRTrainer {
                     for i in 0..n_actions {
                         if prune {
                             if explored[i] {
-
                                 // cap regrets
-                                let mut new_regret = i64::from(infoset.regrets[i]) + 
-                                    (100.0 * cfr_reach * (utils[i] - util)) as i64;
+                                let mut new_regret = i64::from(infoset.regrets[i])
+                                    + (100.0 * cfr_reach * (utils[i] - util)) as i64;
                                 if new_regret > i32::MAX.into() {
                                     new_regret = i32::MAX.into();
                                 } else if new_regret < i32::MIN.into() {
@@ -429,21 +433,19 @@ impl MCCFRTrainer {
                                 }
                                 unsafe { (*infoset_mut).regrets[i] = new_regret as i32 };
 
-                                let mut new_ssum = i64::from(infoset.strategy_sum[i]) +
-                                    (100.0 * cfr_reach * strategy[i]) as i64;
+                                let mut new_ssum = i64::from(infoset.strategy_sum[i])
+                                    + (100.0 * cfr_reach * strategy[i]) as i64;
                                 if new_ssum > i32::MAX.into() {
                                     new_ssum = i32::MAX.into();
                                 } else if new_ssum < i32::MIN.into() {
                                     new_ssum = i32::MIN.into();
                                 }
                                 unsafe { (*infoset_mut).strategy_sum[i] = new_ssum as i32 };
-                            
                             }
                         } else {
-
                             // cap regrets
-                            let mut new_regret = i64::from(infoset.regrets[i]) + 
-                                (100.0 * cfr_reach * (utils[i] - util)) as i64;
+                            let mut new_regret = i64::from(infoset.regrets[i])
+                                + (100.0 * cfr_reach * (utils[i] - util)) as i64;
                             if new_regret > i32::MAX.into() {
                                 new_regret = i32::MAX.into();
                             } else if new_regret < i32::MIN.into() {
@@ -451,15 +453,14 @@ impl MCCFRTrainer {
                             }
                             unsafe { (*infoset_mut).regrets[i] = new_regret as i32 };
 
-                            let mut new_ssum = i64::from(infoset.strategy_sum[i]) +
-                                (100.0 * cfr_reach * strategy[i]) as i64;
+                            let mut new_ssum = i64::from(infoset.strategy_sum[i])
+                                + (100.0 * cfr_reach * strategy[i]) as i64;
                             if new_ssum > i32::MAX.into() {
                                 new_ssum = i32::MAX.into();
                             } else if new_ssum < i32::MIN.into() {
                                 new_ssum = i32::MIN.into();
                             }
                             unsafe { (*infoset_mut).strategy_sum[i] = new_ssum as i32 };
-
                         }
                     }
 
@@ -471,159 +472,166 @@ impl MCCFRTrainer {
                     let dist = WeightedIndex::new(&strategy).unwrap();
                     let a_idx = dist.sample(rng);
                     return self.mccfr(
-                        rng, node.children[a_idx],
-                        player, hand, cfr_reach * strategy[a_idx], prune);
+                        rng,
+                        node.children[a_idx],
+                        player,
+                        hand,
+                        cfr_reach * strategy[a_idx],
+                        prune,
+                    );
                 }
             }
         }
     }
 
-    fn cfr(&self, node_id: NodeId,
-        player: u8, mut hand: TrainHand,
-        cfr_reach: f32, prune: bool) -> f32 {
-            let node = self.game_tree.get_node(node_id);
-            match &node.data {
-                GameTreeNode::PrivateChance => {
-                    let hole_combos = generate_all_hole_card_combos(
-                        self.initial_board_mask,
-                        self.hand_ranges.as_slice()
+    fn cfr(
+        &self,
+        node_id: NodeId,
+        player: u8,
+        mut hand: TrainHand,
+        cfr_reach: f32,
+        prune: bool,
+    ) -> f32 {
+        let node = self.game_tree.get_node(node_id);
+        match &node.data {
+            GameTreeNode::PrivateChance => {
+                let hole_combos = generate_all_hole_card_combos(
+                    self.initial_board_mask,
+                    self.hand_ranges.as_slice(),
+                );
+                let child_cfr_reach = cfr_reach * (1.0 / hole_combos.len() as f32);
+                let util = AtomicCell::new(0f32);
+                hole_combos.par_iter().for_each(|combo| {
+                    let u = self.cfr(
+                        node.children[0],
+                        player,
+                        combo.clone(),
+                        child_cfr_reach,
+                        prune,
                     );
-                    let child_cfr_reach = cfr_reach * (1.0 / hole_combos.len() as f32);
-                    let util = AtomicCell::new(0f32);
-                    hole_combos.par_iter().for_each(|combo| {
-                        let u = self.cfr(
-                            node.children[0], player,
-                            combo.clone(), child_cfr_reach, prune
-                        );
-                        util.store(util.load() + u);
-                    });
-                    return util.load();
-                },
-                GameTreeNode::PublicChance(pc) => {
-                    let possible_deals =
-                        generate_possible_next_deals(pc.round, &hand);
-                    let next_index = match pc.round {
-                        BettingRound::Flop => panic!("should not get here"),
-                        BettingRound::Turn => 5,
-                        BettingRound::River => 6
-                    };
-                    let child_cfr_reach = cfr_reach * (1.0 / possible_deals.len() as f32);
-                    let util = AtomicCell::new(0f32);
-                    possible_deals.par_iter().for_each(|card| {
-                        let mut next_hand = hand.clone();
-                        next_hand.board[next_index] = *card;
-                        let u = self.cfr(
-                            node.children[0], player,
-                            next_hand, child_cfr_reach, prune
-                        );
-                        util.store(util.load() + u);
-                    });
-                    return util.load();
-                },
-                GameTreeNode::Terminal(tn) => {
-                    match tn.ttype {
-                        TerminalType::UNCONTESTED => {
-                            if player == tn.last_to_act {
-                                return -1.0 * (tn.value as f32);
-                            } else {
-                                return 1.0 * (tn.value as f32);
-                            }
-                        },
-                        TerminalType::SHOWDOWN => {
-                            let hands = [hand.get_hand(0), hand.get_hand(1)];
-                            let scores = [evaluate(&hands[0]), evaluate(&hands[1])];
-                            if scores[0] == scores[1] {
-                                return 0.0;
-                            }
-                            if scores[usize::from(player)] > scores[usize::from(1-player)] {
-                                return 1.0 * (tn.value as f32);
-                            } else {
-                                return -1.0 * (tn.value as f32);
-                            }
-                        },
-                        TerminalType::ALLIN => {
-                            // evaluate as showdown
-                            let hands = [hand.get_hand(0), hand.get_hand(1)];
-                            let scores = [evaluate(&hands[0]), evaluate(&hands[1])];
-                            if scores[0] == scores[1] {
-                                return 0.0;
-                            }
-                            if scores[usize::from(player)] > scores[usize::from(1-player)] {
-                                return 1.0 * (tn.value as f32);
-                            } else {
-                                return -1.0 * (tn.value as f32);
-                            }
-                        }
-                    }
-                },
-                GameTreeNode::Action(an) => {
-                    let n_actions = an.actions.len();
-                    // copy hole cards to board
-                    hand.board[0] = hand.hands[usize::from(an.player)].0;
-                    hand.board[1] = hand.hands[usize::from(an.player)].1;
-                    let cluster_idx = match &self.card_abs[usize::from(an.round_idx)] {
-                        CardAbstraction::EMD(card_abs) => card_abs.get_cluster(&hand.board, an.player),
-                        CardAbstraction::ISOMORPHIC(card_abs) => card_abs.get_cluster(&hand.board, an.player),
-                        CardAbstraction::OCHS(card_abs) => card_abs.get_cluster(&hand.board, an.player)
-                    };
-
-
-                    let mut util = 0f32;
-                    let mut utils = vec![0f32; n_actions];
-                    let infoset = &self.infosets[an.index][cluster_idx];
-                    let strategy = infoset.get_strategy();
-
-                    for i in 0..n_actions {
-                        if an.player == player {
-                            utils[i] = self.cfr(
-                                node.children[i], player,
-                                hand, cfr_reach, prune
-                            );
+                    util.store(util.load() + u);
+                });
+                return util.load();
+            }
+            GameTreeNode::PublicChance(pc) => {
+                let possible_deals = generate_possible_next_deals(pc.round, &hand);
+                let next_index = match pc.round {
+                    BettingRound::Flop => panic!("should not get here"),
+                    BettingRound::Turn => 5,
+                    BettingRound::River => 6,
+                };
+                let child_cfr_reach = cfr_reach * (1.0 / possible_deals.len() as f32);
+                let util = AtomicCell::new(0f32);
+                possible_deals.par_iter().for_each(|card| {
+                    let mut next_hand = hand.clone();
+                    next_hand.board[next_index] = *card;
+                    let u = self.cfr(node.children[0], player, next_hand, child_cfr_reach, prune);
+                    util.store(util.load() + u);
+                });
+                return util.load();
+            }
+            GameTreeNode::Terminal(tn) => {
+                match tn.ttype {
+                    TerminalType::UNCONTESTED => {
+                        if player == tn.last_to_act {
+                            return -1.0 * (tn.value as f32);
                         } else {
-                            utils[i] = self.cfr(
-                                node.children[i], player,
-                                hand, strategy[i] * cfr_reach, prune
-                            );
-                        }
-                        util += utils[i] * strategy[i];
-                    }
-
-                    let cards = [
-                        4u8 * 12 + 0,
-                        4u8 * 0 + 0
-                    ];
-                    if an.index == 0 && (hand.hands[usize::from(an.player)].0 == cards[0]) && (hand.hands[usize::from(an.player)].1 == cards[1]) {
-                        for action in &an.actions {
-                            print!("{} ", action.to_string());
-                        }
-                        println!("");
-                        for i in 0..n_actions {
-                            print!("{} ", infoset.regrets[i]);
-                        }
-                        println!("");
-                    }
-                    
-
-
-                    if an.player != player {
-                        return util;
-                    }
-
-                    let infoset_mut = (infoset as *const Infoset) as *mut Infoset;
-                    let strategy = infoset.get_strategy();
-                    for i in 0..n_actions {
-                        unsafe {
-                            (*infoset_mut).regrets[i] +=
-                                (10000.0 * cfr_reach * (utils[i] - util)) as i32;
-                            (*infoset_mut).strategy_sum[i] +=
-                                (10000.0 * cfr_reach * strategy[i]) as i32;
+                            return 1.0 * (tn.value as f32);
                         }
                     }
-
-                    return util;
-
+                    TerminalType::SHOWDOWN => {
+                        let hands = [hand.get_hand(0), hand.get_hand(1)];
+                        let scores = [evaluate(&hands[0]), evaluate(&hands[1])];
+                        if scores[0] == scores[1] {
+                            return 0.0;
+                        }
+                        if scores[usize::from(player)] > scores[usize::from(1 - player)] {
+                            return 1.0 * (tn.value as f32);
+                        } else {
+                            return -1.0 * (tn.value as f32);
+                        }
+                    }
+                    TerminalType::ALLIN => {
+                        // evaluate as showdown
+                        let hands = [hand.get_hand(0), hand.get_hand(1)];
+                        let scores = [evaluate(&hands[0]), evaluate(&hands[1])];
+                        if scores[0] == scores[1] {
+                            return 0.0;
+                        }
+                        if scores[usize::from(player)] > scores[usize::from(1 - player)] {
+                            return 1.0 * (tn.value as f32);
+                        } else {
+                            return -1.0 * (tn.value as f32);
+                        }
+                    }
                 }
             }
+            GameTreeNode::Action(an) => {
+                let n_actions = an.actions.len();
+                // copy hole cards to board
+                hand.board[0] = hand.hands[usize::from(an.player)].0;
+                hand.board[1] = hand.hands[usize::from(an.player)].1;
+                let cluster_idx = match &self.card_abs[usize::from(an.round_idx)] {
+                    CardAbstraction::EMD(card_abs) => card_abs.get_cluster(&hand.board, an.player),
+                    CardAbstraction::ISOMORPHIC(card_abs) => {
+                        card_abs.get_cluster(&hand.board, an.player)
+                    }
+                    CardAbstraction::OCHS(card_abs) => card_abs.get_cluster(&hand.board, an.player),
+                };
+
+                let mut util = 0f32;
+                let mut utils = vec![0f32; n_actions];
+                let infoset = &self.infosets[an.index][cluster_idx];
+                let strategy = infoset.get_strategy();
+
+                for i in 0..n_actions {
+                    if an.player == player {
+                        utils[i] = self.cfr(node.children[i], player, hand, cfr_reach, prune);
+                    } else {
+                        utils[i] = self.cfr(
+                            node.children[i],
+                            player,
+                            hand,
+                            strategy[i] * cfr_reach,
+                            prune,
+                        );
+                    }
+                    util += utils[i] * strategy[i];
+                }
+
+                let cards = [4u8 * 12 + 0, 4u8 * 0 + 0];
+                if an.index == 0
+                    && (hand.hands[usize::from(an.player)].0 == cards[0])
+                    && (hand.hands[usize::from(an.player)].1 == cards[1])
+                {
+                    for action in &an.actions {
+                        print!("{} ", action.to_string());
+                    }
+                    println!("");
+                    for i in 0..n_actions {
+                        print!("{} ", infoset.regrets[i]);
+                    }
+                    println!("");
+                }
+
+                if an.player != player {
+                    return util;
+                }
+
+                let infoset_mut = (infoset as *const Infoset) as *mut Infoset;
+                let strategy = infoset.get_strategy();
+                for i in 0..n_actions {
+                    unsafe {
+                        (*infoset_mut).regrets[i] +=
+                            (10000.0 * cfr_reach * (utils[i] - util)) as i32;
+                        (*infoset_mut).strategy_sum[i] +=
+                            (10000.0 * cfr_reach * strategy[i]) as i32;
+                    }
+                }
+
+                return util;
+            }
+        }
     }
 
     fn calc_br(&self) -> Vec<f32> {
@@ -642,13 +650,13 @@ impl MCCFRTrainer {
         match &node.data {
             GameTreeNode::Terminal(_) => {
                 return self.abstract_br_terminal(curr_node, op);
-            },
+            }
             GameTreeNode::PublicChance(_) => {
                 return self.abstract_br(node.children[0], op);
-            },
+            }
             GameTreeNode::PrivateChance => {
                 return self.abstract_br(node.children[0], op);
-            },
+            }
             _ => {
                 return self.abstract_br_infoset(curr_node, op);
             }
@@ -695,8 +703,8 @@ impl MCCFRTrainer {
                 res[usize::from(an.player)][0] = max_val;
                 res[opp][0] = payoffs[max_index][opp][0];
                 return res;
-            },
-            _ => panic!("error")
+            }
+            _ => panic!("error"),
         }
     }
 
@@ -710,20 +718,22 @@ impl MCCFRTrainer {
 
                 match tn.ttype {
                     TerminalType::UNCONTESTED => {
-                        let fold_player = tn.last_to_act;
+                        let fold_player = tn.last_to_act as usize;
 
                         let mut opp_ges_p = vec![0.0; 2];
                         for p in 0..op.len() {
                             let opp = 1 - p;
                             for g in 0..op[0].len() {
-                                payoffs[p][g] = op[opp][g] * (if p == fold_player.into() { -1.0 } else { 1.0 }) * money_f;
+                                payoffs[p][g] = op[opp][g]
+                                    * (if p == fold_player { -1.0 } else { 1.0 })
+                                    * money_f;
                                 res[p][0] += payoffs[p][g];
                                 opp_ges_p[p] += op[opp][g];
                             }
                             res[p][0] *= 1.0 / opp_ges_p[p];
                         }
                         return res;
-                    },
+                    }
                     _ => {
                         let mut opp_ges_p = vec![0.0; 2];
                         for p in 0..op.len() {
@@ -738,8 +748,8 @@ impl MCCFRTrainer {
                         return res;
                     }
                 }
-            },
-            _ => panic!("error")
+            }
+            _ => panic!("error"),
         }
     }
 }

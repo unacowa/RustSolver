@@ -10,7 +10,6 @@ extern crate test;
 extern crate rayon;
 extern crate crossbeam;
 extern crate hashbrown;
-extern crate cortex_m;
 
 mod constants;
 mod state;

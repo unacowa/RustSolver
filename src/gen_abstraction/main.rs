@@ -30,9 +30,9 @@ use rand::{thread_rng, Rng, SeedableRng};
 
 use rayon::prelude::*;
 
-use rust_poker::equity_calculator::calc_equity;
-use rust_poker::hand_indexer_s;
-use rust_poker::hand_range::{char_to_rank, HandRange, HoleCards};
+use hand_indexer::HandIndexer;
+use rust_poker::equity_calculator::approx_equity;
+use rust_poker::hand_range::{char_to_rank, Combo, HandRange};
 
 // use kmeans::Kmeans;
 
@@ -193,7 +193,7 @@ fn generate_opponent_clusters(n_opp_clusters: usize) -> Vec<String> {
     // transform clusters into range string representation
     for i in 0..169 {
         ehs_table.indexers[0].get_hand(0, i as u64, cards.as_mut_slice());
-        let hand_str = HoleCards(cards[0], cards[1]).to_string();
+        let hand_str = Combo(cards[0], cards[1], 100).to_string();
         let char_vec: Vec<char> = hand_str
             .chars()
             .map(|c| c.to_lowercase().next().unwrap())
@@ -225,7 +225,7 @@ fn generate_opponent_clusters(n_opp_clusters: usize) -> Vec<String> {
         // println!("{}", opp_ranges[i].0);
         let ranges =
             HandRange::from_strings([opp_ranges[i].0.to_string(), "random".to_string()].to_vec());
-        opp_ranges[i].1 = calc_equity(&ranges, 0, 1, 10000)[0] as f32;
+        opp_ranges[i].1 = approx_equity(&ranges, 0, 1, 0.001).unwrap()[0] as f32;
     }
 
     // sort by all in equity
@@ -276,7 +276,7 @@ fn generate_opponent_clusters(n_opp_clusters: usize) -> Vec<String> {
 //         let mut cards = vec![0u8; total_cards];
 //         ehs_table.indexers[usize::from(round)]
 //             .get_hand(if round == 0 { 0 } else { 1 }, i as u64, cards.as_mut_slice());
-//         let hand_str = HoleCards(cards[0], cards[1]).to_string();
+//         let hand_str = Combo(cards[0], cards[1], 100).to_string();
 
 //         let mut norm_sum = 0f32;
 //         for i in 0..n_opp_clusters {
@@ -288,7 +288,7 @@ fn generate_opponent_clusters(n_opp_clusters: usize) -> Vec<String> {
 //             for i in 2..total_cards {
 //                 board_mask |= 1u64 << cards[i];
 //             }
-//             let e = calc_equity(&hand_ranges, board_mask, 1, 1000)[0] as f32;
+//             let e = approx_equity(&hand_ranges, board_mask, 1, 0.01).unwrap()[0] as f32;
 //             hist[i] = e;
 //             norm_sum += e;
 //         }
@@ -345,10 +345,10 @@ fn gen_emd(round: u8, n_clusters: usize, n_samples: usize, n_bins: usize) {
     let mut rng = thread_rng();
 
     let hand_indexer = match round {
-        0 => hand_indexer_s::init(1, vec![2]),
-        1 => hand_indexer_s::init(2, vec![2, 3]),
-        2 => hand_indexer_s::init(2, vec![2, 4]),
-        3 => hand_indexer_s::init(2, vec![2, 5]),
+        0 => HandIndexer::init(1, vec![2]),
+        1 => HandIndexer::init(2, vec![2, 3]),
+        2 => HandIndexer::init(2, vec![2, 4]),
+        3 => HandIndexer::init(2, vec![2, 5]),
         _ => panic!("Invalid round!"),
     };
 
